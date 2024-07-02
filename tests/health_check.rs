@@ -1,7 +1,32 @@
 use std::net::TcpListener;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use zero2prod::config::{get_configuration, DatabaseSettings};
+use zero2prod::telemetry::{get_subscriber, init_subscriber};
 use uuid::Uuid;
+use once_cell::sync::Lazy;
+use secrecy::ExposeSecret;
+
+static TRACING: Lazy<()> = Lazy::new(|| {
+	let default_filter_level = "info".to_string();
+	let subscriber_name = "test".to_string();
+	
+	if std::env::var("TEST_LOG").is_ok() {
+		let subscriber = get_subscriber(
+			subscriber_name,
+			default_filter_level,
+			std::io::stdout
+		);
+		init_subscriber(subscriber);
+	} else {
+		let subscriber = get_subscriber(
+			subscriber_name,
+			default_filter_level,
+			std::io::sink
+		);
+		init_subscriber(subscriber);
+	}
+	
+});
 
 #[tokio::test]
 async fn subscribe_returns_a_200_for_valid_form_data() {
@@ -30,6 +55,38 @@ async fn subscribe_returns_a_200_for_valid_form_data() {
 	assert_eq!(saved.name, "jamie");
 	
 	cleanup_database(&app).await;
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_200_when_fields_are_present_but_empty() {
+	// Arrange
+	let (app, client) = setup_for_tests().await;
+	let test_cases = vec![
+		("name=&email=hello%40madebyjamie.com", "empty name"),
+		("name=jamie&email=", "empty email"),
+		("name=jamie&email=not-an-email", "invalid email")
+	];
+	
+	// Act
+	
+	for (body, description) in test_cases {
+		// Act
+		let response = client
+			.post(&format!("{}/subscriptions", &app.address))
+			.header("Content-Type", "application/x-www-form-urlencoded")
+			.body(body)
+			.send()
+			.await
+			.expect("Failed to execute request");
+			
+		// Assert
+		assert_eq!(
+			200,
+			response.status().as_u16(),
+			// Additional custom error messages
+			"The API did not return a 200 OK when the payload was {}.", description
+		);
+	}
 }
 
 #[tokio::test]
@@ -90,6 +147,10 @@ pub struct TestApp {
 }
 
 async fn spawn_app() -> TestApp {
+	// First time 'initialise' is invoked the code in 'TRACING' is executed.
+	// All other invocations will instead skip execution
+	Lazy::force(&TRACING);
+	
 	let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
 	let port = listener.local_addr().unwrap().port();
 	let address = format!("http://127.0.0.1:{}", port);
@@ -112,7 +173,7 @@ pub async fn cleanup_database(app: &TestApp) {
 	app.db_pool.close().await;
 	
 	let mut connection = PgConnection::connect(
-			&app.db_config.connection_string_without_db()
+			&app.db_config.connection_string_without_db().expose_secret()
 		)
 		.await
 		.expect("Failed to connect to Postgres");
@@ -125,7 +186,7 @@ pub async fn cleanup_database(app: &TestApp) {
 pub async fn configure_database(config: &DatabaseSettings) -> PgPool {
 	// Create database
 	let mut connection = PgConnection::connect(
-			&config.connection_string_without_db()
+			&config.connection_string_without_db().expose_secret()
 		)
 		.await
 		.expect("Failed to connect to Postgres");
@@ -134,8 +195,8 @@ pub async fn configure_database(config: &DatabaseSettings) -> PgPool {
 		.await
 		.expect("Failed to create database");
 	
-	// MIgrate database
-	let connection_pool = PgPool::connect(&config.connection_string())
+	// Migrate database
+	let connection_pool = PgPool::connect(&config.connection_string().expose_secret())
 		.await
 		.expect("Failed to connect to Postgres");
 	
